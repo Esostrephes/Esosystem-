@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
-# ==============================
-# UNIVERSITY ATTENDANCE SYSTEM
-# FastAPI + MySQL + Redis
-# REAL Liveness (MediaPipe Head Movement in Browser)
-# JWT Admin Auth
-# BATCH ATTENDANCE (Sequential for 1-100 students)
-# ==============================
+
 
 from fastapi import FastAPI, Form, HTTPException, Request, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
