@@ -1,4 +1,41 @@
-
+#!/usr/bin/env python3
+# ==============================
+# UNIVERSITY ATTENDANCE SYSTEM
+# FastAPI + Supabase + Redis
+# REAL Liveness (MediaPipe Head Movement in Browser)
+# JWT Admin Auth
+# BATCH ATTENDANCE (Sequential for 1-100 students)
+# ==============================
+#
+# SUPABASE SETUP — run these in Supabase SQL Editor before starting:
+#
+#   CREATE TABLE students (
+#       id          BIGSERIAL PRIMARY KEY,
+#       student_id  TEXT UNIQUE NOT NULL,
+#       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+#   );
+#
+#   CREATE TABLE attendance (
+#       id          BIGSERIAL PRIMARY KEY,
+#       student_id  TEXT NOT NULL,
+#       timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+#       marked_by   TEXT DEFAULT 'self'
+#   );
+#   CREATE INDEX idx_att_student   ON attendance(student_id);
+#   CREATE INDEX idx_att_timestamp ON attendance(timestamp);
+#
+#   CREATE TABLE admins (
+#       id            BIGSERIAL PRIMARY KEY,
+#       username      TEXT UNIQUE NOT NULL,
+#       password_hash TEXT NOT NULL
+#   );
+#
+# Required env vars:
+#   SUPABASE_URL      — e.g. https://xxxx.supabase.co
+#   SUPABASE_KEY      — service_role secret key  (NOT the anon key)
+#   REDIS_HOST        — optional, falls back to in-memory
+#   JWT_SECRET        — your own secret string
+# ==============================
 
 from fastapi import FastAPI, Form, HTTPException, Request, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,9 +43,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-from datetime import datetime, timedelta
-import pymysql
-import pymysql.cursors
+from datetime import datetime, timedelta, timezone
+from supabase import create_client, Client
 import redis
 import random
 import uuid
@@ -16,20 +52,17 @@ import os
 import time
 import logging
 from typing import List, Dict, Optional
-from contextlib import contextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- CONFIG ----------------
 
-MYSQL_CONFIG = {
-    "host": os.getenv("MYSQL_HOST", "localhost"),
-    "user": os.getenv("MYSQL_USER", "root"),
-    "password": os.getenv("MYSQL_PASSWORD", ""),
-    "database": os.getenv("MYSQL_DB", "attendance_db"),
-    "connect_timeout": 10,
-}
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")   # use service_role key
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_KEY environment variables are required")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -49,30 +82,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Database connection with auto-reconnect ----
-_db_connection: Optional[pymysql.connections.Connection] = None
-
-def get_db() -> pymysql.connections.Connection:
-    """Return a live MySQL connection, reconnecting if needed."""
-    global _db_connection
-    try:
-        if _db_connection is None or not _db_connection.open:
-            raise pymysql.OperationalError("No connection")
-        _db_connection.ping(reconnect=True)
-    except (pymysql.OperationalError, pymysql.InterfaceError):
-        logger.info("Reconnecting to MySQL...")
-        _db_connection = pymysql.connect(**MYSQL_CONFIG, autocommit=True)
-    return _db_connection
-
-@contextmanager
-def db_cursor():
-    """Context manager for a database cursor with auto-reconnect."""
-    conn = get_db()
-    cursor = conn.cursor()
-    try:
-        yield cursor
-    finally:
-        cursor.close()
+# ---- Supabase client (singleton) ----
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+logger.info("Supabase client initialised.")
 
 # ---- Redis connection with graceful degradation ----
 _redis_client: Optional[redis.Redis] = None
@@ -133,36 +145,8 @@ def cache_set(key: str, value: str, ex: int) -> None:
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/login")
 
-# ---------------- DATABASE SETUP ----------------
-
-def init_db():
-    with db_cursor() as cursor:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS students (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                student_id VARCHAR(100) UNIQUE NOT NULL,
-                created_at DATETIME NOT NULL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS attendance (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                student_id VARCHAR(100) NOT NULL,
-                timestamp DATETIME NOT NULL,
-                marked_by VARCHAR(100) DEFAULT 'self',
-                INDEX idx_student (student_id),
-                INDEX idx_timestamp (timestamp)
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                username VARCHAR(100) UNIQUE NOT NULL,
-                password_hash VARCHAR(255) NOT NULL
-            )
-        """)
-
-init_db()
+# Tables are created via Supabase SQL Editor (see top-of-file instructions).
+# No runtime schema migration needed.
 
 # ---------------- AUTH ----------------
 
@@ -194,24 +178,28 @@ def create_admin(username: str = Form(...), password: str = Form(...)):
     if len(username) < 3 or len(password) < 6:
         raise HTTPException(400, "Username ≥3 chars, password ≥6 chars")
     hashed = pwd_context.hash(password)
-    with db_cursor() as cursor:
-        try:
-            cursor.execute(
-                "INSERT INTO admins (username, password_hash) VALUES (%s, %s)",
-                (username, hashed),
-            )
-        except pymysql.IntegrityError:
+    try:
+        supabase.table("admins").insert({
+            "username": username,
+            "password_hash": hashed,
+        }).execute()
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
             raise HTTPException(400, "Admin already exists")
+        raise HTTPException(500, f"Database error: {e}")
     return {"status": "admin_created"}
 
 @app.post("/admin/login")
 def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
-    with db_cursor() as cursor:
-        cursor.execute(
-            "SELECT password_hash FROM admins WHERE username=%s", (form_data.username,)
-        )
-        result = cursor.fetchone()
-    if not result or not pwd_context.verify(form_data.password, result[0]):
+    result = (
+        supabase.table("admins")
+        .select("password_hash")
+        .eq("username", form_data.username)
+        .maybe_single()
+        .execute()
+    )
+    row = result.data
+    if not row or not pwd_context.verify(form_data.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token({"sub": form_data.username})
     return {"access_token": token, "token_type": "bearer"}
@@ -221,19 +209,26 @@ def verify_token(current_admin: str = Depends(get_current_admin)):
     """Endpoint to validate a stored token without side effects."""
     return {"valid": True, "username": current_admin}
 
-# Protected admin endpoints
 @app.get("/analytics", response_model=Dict)
 def analytics(current_admin: str = Depends(get_current_admin)):
-    with db_cursor() as cursor:
-        cursor.execute("SELECT COUNT(*) FROM attendance")
-        total = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(DISTINCT student_id) FROM attendance")
-        unique_students = cursor.fetchone()[0]
-        today = datetime.now().date()
-        cursor.execute(
-            "SELECT COUNT(*) FROM attendance WHERE DATE(timestamp) = %s", (today,)
-        )
-        today_count = cursor.fetchone()[0]
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    total_res = supabase.table("attendance").select("id", count="exact").execute()
+    total = total_res.count or 0
+
+    # Count unique students (fetch all ids, deduplicate in Python — Supabase free tier
+    # doesn't expose COUNT(DISTINCT) directly via the PostgREST API)
+    unique_res = supabase.table("attendance").select("student_id").execute()
+    unique_students = len({row["student_id"] for row in (unique_res.data or [])})
+
+    today_res = (
+        supabase.table("attendance")
+        .select("id", count="exact")
+        .gte("timestamp", today_start)
+        .execute()
+    )
+    today_count = today_res.count or 0
+
     return {
         "total_attendance_records": total,
         "unique_students_all_time": unique_students,
@@ -243,14 +238,13 @@ def analytics(current_admin: str = Depends(get_current_admin)):
 
 @app.get("/students", response_model=List[Dict])
 def get_students(current_admin: str = Depends(get_current_admin)):
-    with db_cursor() as cursor:
-        cursor.execute(
-            "SELECT student_id, created_at FROM students ORDER BY created_at DESC"
-        )
-        students = [
-            {"student_id": row[0], "created_at": str(row[1])} for row in cursor.fetchall()
-        ]
-    return students
+    result = (
+        supabase.table("students")
+        .select("student_id, created_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
 
 # ---------------- REGISTRATION ----------------
 
@@ -259,28 +253,31 @@ def register(student_id: str = Form(...)):
     student_id = student_id.strip()
     if not student_id or len(student_id) > 100:
         raise HTTPException(400, "Invalid student ID")
-    with db_cursor() as cursor:
-        try:
-            cursor.execute(
-                "INSERT INTO students (student_id, created_at) VALUES (%s, %s)",
-                (student_id, datetime.now()),
-            )
-        except pymysql.IntegrityError:
+    try:
+        supabase.table("students").insert({
+            "student_id": student_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
             raise HTTPException(400, "Student already registered")
+        raise HTTPException(500, f"Database error: {e}")
     return {"status": "registered", "student_id": student_id}
 
-# ---- FIX #1: was @app.get but used Form body — changed to POST ----
 @app.post("/challenge")
 def generate_challenge(student_id: str = Form(...)):
     """Generate a unique liveness challenge per student session."""
     student_id = student_id.strip()
     # Verify student exists
-    with db_cursor() as cursor:
-        cursor.execute(
-            "SELECT student_id FROM students WHERE student_id=%s", (student_id,)
-        )
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Student not registered")
+    result = (
+        supabase.table("students")
+        .select("student_id")
+        .eq("student_id", student_id)
+        .maybe_single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Student not registered")
 
     challenges = ["LEFT", "RIGHT", "UP"]
     challenge = random.choice(challenges)
@@ -310,17 +307,22 @@ def mark_attendance(
     if movement != expected.upper():
         raise HTTPException(status_code=403, detail="Liveness check failed")
 
-    with db_cursor() as cursor:
-        cursor.execute(
-            "SELECT student_id FROM students WHERE student_id=%s", (student_id,)
-        )
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Student not registered")
+    # Verify student exists
+    student_res = (
+        supabase.table("students")
+        .select("student_id")
+        .eq("student_id", student_id)
+        .maybe_single()
+        .execute()
+    )
+    if not student_res.data:
+        raise HTTPException(status_code=404, detail="Student not registered")
 
-        cursor.execute(
-            "INSERT INTO attendance (student_id, timestamp) VALUES (%s, %s)",
-            (student_id, datetime.now()),
-        )
+    supabase.table("attendance").insert({
+        "student_id": student_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "marked_by": "self",
+    }).execute()
 
     cache_set(f"last_seen:{student_id}", str(datetime.now()), ex=86400)
     return {"status": "attendance_marked", "student_id": student_id}
